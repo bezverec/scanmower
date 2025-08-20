@@ -21,3 +21,6 @@ ScanMower is a program written in pure Rust. It's basically a simplified version
 
 ## AI generetad code disclosure
 - The code is AI generetated using ChatGPT model 5.
+
+## Screenshot
+<img width="1920" height="1040" alt="scanmower_0-1-0" src="https://github.com/user-attachments/assets/2e21908e-8734-4abd-b37d-1faa6a627a4f" />
