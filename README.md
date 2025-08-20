@@ -8,6 +8,7 @@ ScanMower is a program written in pure Rust. It's basically a simplified version
 - There are no advanced features such as dewarping.
 - The output images are not 1:1 copies of the original images in terms of image parameters / metadata.
 - The first release has not been properly tested - v0.1.0 is therefore experimental alpha build at best.
+- Currently Windows only.
 
 ## TO-DO
 - English localization.
