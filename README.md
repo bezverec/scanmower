@@ -13,6 +13,7 @@ ScanMower is a program written in pure Rust. It's basically a simplified version
 
 ## TO-DO
 - English localization.
+- Page splitting implementation.
 - Code cleanup.
 - General and bug fixing.
 - Icon improvement.
