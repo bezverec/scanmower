@@ -8,3 +8,6 @@ fn main() {
     ];
     embed_resource::compile("assets/scanmower.rc", macros);
 }
+
+#[cfg(not(target_os = "windows"))]
+fn main() {}
