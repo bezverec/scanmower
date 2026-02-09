@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use eframe::egui::{self, ColorImage};
@@ -38,7 +39,10 @@ fn main() -> eframe::Result<()> {
     };
 
     // Pokud tvoje verze eframe vrací z closure Result, nech `Ok(...)`:
-    eframe::run_native("ScanMower", native, Box::new(|_cc| Ok(Box::new(App::default()))))
+    eframe::run_native("ScanMower", native, Box::new(|_cc| {
+        let _ = std::fs::create_dir_all(cache_root_dir());
+        Ok(Box::new(App::default()))
+    }))
     
     // Pokud máš starší API, kde closure vrací rovnou Box<dyn App>, použij toto:
     // eframe::run_native("ScanMower", native, Box::new(|_cc| Box::<App>::default()))
@@ -47,6 +51,7 @@ fn main() -> eframe::Result<()> {
 // Aplikovat na
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 enum ApplyScope {
+    OnlyThis,
     All,
     FromHere,
     EveryOther,
@@ -55,6 +60,7 @@ enum ApplyScope {
 impl ApplyScope {
     fn label(self) -> &'static str {
         match self {
+            ApplyScope::OnlyThis => "Aplikovat pouze na tento sken",
             ApplyScope::All => "Aplikovat na vše",
             ApplyScope::FromHere => "Aplikovat na vše od tohoto skenu",
             ApplyScope::EveryOther => "Aplikovat na každou druhou stranu",
@@ -127,6 +133,17 @@ struct Params {
     rename_enabled: bool,
     rename_mask: String, // např. "scan_###"
     rename_start: usize, // počáteční číslo
+
+    // Page splitting (two-page scan)
+    // If enabled, export will produce two pages (left + right).
+    split_enabled: bool,
+    // Vertical split position in normalized coordinates of the rotated preview/image: 0.0..1.0
+    // Split X position at TOP in normalized coordinates of the rotated preview/image: 0.0..1.0
+    #[serde(default)]
+    split_x_top_norm: f32,
+    // Split X position at BOTTOM in normalized coordinates of the rotated preview/image: 0.0..1.0
+    #[serde(default)]
+    split_x_bottom_norm: f32,
 }
 impl Default for Params {
     fn default() -> Self {
@@ -147,6 +164,10 @@ impl Default for Params {
             rename_enabled: false,
             rename_mask: "scan_###".to_string(),
             rename_start: 1,
+
+            split_enabled: false,
+            split_x_top_norm: 0.5,
+            split_x_bottom_norm: 0.5,
         }
     }
 }
@@ -174,16 +195,173 @@ impl Default for FileState {
 #[derive(Hash, Eq, PartialEq, Clone, Serialize, Deserialize)]
 struct CacheKey {
     path: PathBuf,
+    file_len: u64,
+    mtime_unix: i64,
     thr: Option<u8>,
     deskew_tenths: i16,
     auto: bool,
     manual_tenths: i16,
     rotation: Rotation,
 }
+
+fn file_stamp(path: &Path) -> (u64, i64) {
+    let meta = std::fs::metadata(path).ok();
+    let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let mtime = meta
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    (len, mtime)
+}
+
+fn cache_root_dir() -> PathBuf {
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|x| x.to_path_buf()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    base.join("cache")
+}
+
+fn cache_key_id(key: &CacheKey) -> String {
+    let bytes = serde_json::to_vec(key).unwrap_or_default();
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
+fn cache_preview_dir() -> PathBuf {
+    cache_root_dir().join("preview")
+}
+
+fn cache_thumb_dir() -> PathBuf {
+    cache_root_dir().join("thumb")
+}
+
+fn cache_paths(key: &CacheKey) -> (PathBuf, PathBuf) {
+    let root = cache_preview_dir();
+    let id = cache_key_id(key);
+    (root.join(format!("{id}.png")), root.join(format!("{id}.json")))
+}
+
+fn load_disk_cached_color_image(key: &CacheKey) -> Option<ColorImage> {
+    let (png_path, json_path) = cache_paths(key);
+    let j = std::fs::read(&json_path).ok()?;
+    let stored: CacheKey = serde_json::from_slice(&j).ok()?;
+    if &stored != key {
+        return None;
+    }
+    let bytes = std::fs::read(png_path).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let pixels = img.into_raw();
+    Some(ColorImage::from_rgba_unmultiplied(size, &pixels))
+}
+
+fn save_disk_cached_rgba(key: &CacheKey, rgba: &image::RgbaImage) {
+    let root = cache_preview_dir();
+    let _ = std::fs::create_dir_all(&root);
+    let (png_path, json_path) = cache_paths(key);
+
+    // zmenši pro cache (rychlé načítání); zachovej poměr stran
+    let max_dim: u32 = 1600;
+    let (w, h) = (rgba.width(), rgba.height());
+    let thumb = if w.max(h) > max_dim {
+        let (nw, nh) = if w >= h {
+            (max_dim, ((h as f32) * (max_dim as f32) / (w as f32)).round().max(1.0) as u32)
+        } else {
+            (((w as f32) * (max_dim as f32) / (h as f32)).round().max(1.0) as u32, max_dim)
+        };
+        image::imageops::resize(rgba, nw, nh, image::imageops::FilterType::Triangle)
+    } else {
+        rgba.clone()
+    };
+
+    let dynimg = image::DynamicImage::ImageRgba8(thumb);
+    if dynimg
+        .save_with_format(&png_path, image::ImageFormat::Png)
+        .is_ok()
+    {
+        if let Ok(j) = serde_json::to_vec(key) {
+            let _ = std::fs::write(json_path, j);
+        }
+    }
+}
+
+
+// ===== Disk cache: thumbnails (rychlé miniatury do seznamu) =====
+#[derive(Hash, Eq, PartialEq, Clone, Serialize, Deserialize)]
+struct ThumbKey {
+    path: PathBuf,
+    file_len: u64,
+    mtime_unix: i64,
+}
+
+impl ThumbKey {
+    fn from_path(path: &Path) -> Self {
+        let (file_len, mtime_unix) = file_stamp(path);
+        Self { path: path.to_path_buf(), file_len, mtime_unix }
+    }
+}
+
+fn thumb_key_id(key: &ThumbKey) -> String {
+    let bytes = serde_json::to_vec(key).unwrap_or_default();
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
+fn thumb_paths(key: &ThumbKey) -> (PathBuf, PathBuf) {
+    let root = cache_thumb_dir();
+    let id = thumb_key_id(key);
+    (root.join(format!("{id}.png")), root.join(format!("{id}.json")))
+}
+
+fn load_disk_cached_thumb(key: &ThumbKey) -> Option<ColorImage> {
+    let (png_path, json_path) = thumb_paths(key);
+    let j = std::fs::read(&json_path).ok()?;
+    let stored: ThumbKey = serde_json::from_slice(&j).ok()?;
+    if &stored != key {
+        return None;
+    }
+    let bytes = std::fs::read(png_path).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let pixels = img.into_raw();
+    Some(ColorImage::from_rgba_unmultiplied(size, &pixels))
+}
+
+fn save_disk_cached_thumb(key: &ThumbKey, rgba: &image::RgbaImage) {
+    let root = cache_thumb_dir();
+    let _ = std::fs::create_dir_all(&root);
+    let (png_path, json_path) = thumb_paths(key);
+
+    // agresivně malé – jde jen o miniaturu
+    let max_dim: u32 = 512;
+    let (w, h) = (rgba.width(), rgba.height());
+    let thumb = if w.max(h) > max_dim {
+        let (nw, nh) = if w >= h {
+            (max_dim, ((h as f32) * (max_dim as f32) / (w as f32)).round().max(1.0) as u32)
+        } else {
+            (((w as f32) * (max_dim as f32) / (h as f32)).round().max(1.0) as u32, max_dim)
+        };
+        image::imageops::resize(rgba, nw, nh, image::imageops::FilterType::Triangle)
+    } else {
+        rgba.clone()
+    };
+
+    let dynimg = image::DynamicImage::ImageRgba8(thumb);
+    if dynimg.save_with_format(&png_path, image::ImageFormat::Png).is_ok() {
+        if let Ok(j) = serde_json::to_vec(key) {
+            let _ = std::fs::write(json_path, j);
+        }
+    }
+}
+
 impl CacheKey {
     fn from_params(path: &Path, p: &Params) -> Self {
+        let (file_len, mtime_unix) = file_stamp(path);
         Self {
             path: path.to_path_buf(),
+            file_len,
+            mtime_unix,
             thr: p.manual_threshold,
             deskew_tenths: (p.deskew_max_deg * 10.0).round() as i16,
             auto: p.auto_deskew,
@@ -211,6 +389,14 @@ enum CropHandle {
 const EDGE_BAND: f32 = 14.0;
 const CORNER_BAND: f32 = 16.0;
 
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SplitDragKind {
+    Both,
+    Top,
+    Bottom,
+}
+
 struct App {
     files: Vec<PathBuf>,
     selected: Option<usize>,
@@ -225,6 +411,15 @@ struct App {
     cache_order: VecDeque<CacheKey>,
     cache_capacity: usize,
 
+    thumb_cache: HashMap<ThumbKey, egui::TextureHandle>,
+    thumb_order: VecDeque<ThumbKey>,
+    thumb_capacity: usize,
+
+    // Disk cache prewarm (thumbnail cache generation)
+    prewarm_total: usize,
+    prewarm_done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    prewarm_running: bool,
+
     zoom: f32,
 
     last_project_path: Option<PathBuf>,
@@ -234,6 +429,7 @@ struct App {
     scope_narovnani: ApplyScope,
     scope_okraje: ApplyScope,
     scope_orez: ApplyScope,
+    scope_split: ApplyScope,
     scope_vystup: ApplyScope,
     scope_rename: ApplyScope,
 
@@ -245,6 +441,10 @@ struct App {
     drag_keep_ratio: bool,
     drag_from_center: bool,
     drag_aspect: Option<f32>,
+
+    // page splitting: dragging the divider
+    split_dragging: bool,
+    split_drag_kind: SplitDragKind,
 
     // do App
     right_panel_open: bool,
@@ -266,6 +466,12 @@ impl Default for App {
             cache: HashMap::new(),
             cache_order: VecDeque::new(),
             cache_capacity: 64,
+            thumb_cache: HashMap::new(),
+            thumb_order: VecDeque::new(),
+            thumb_capacity: 256,
+            prewarm_total: 0,
+            prewarm_done: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            prewarm_running: false,
             zoom: 1.0,
             drag_handle: None,
             drag_origin_rect: None,
@@ -273,10 +479,13 @@ impl Default for App {
             drag_keep_ratio: false,
             drag_from_center: false,
             drag_aspect: None,
+            split_dragging: false,
+            split_drag_kind: SplitDragKind::Both,
             scope_rotace: ApplyScope::All,
             scope_narovnani: ApplyScope::All,
             scope_okraje: ApplyScope::All,
             scope_orez: ApplyScope::All,
+            scope_split: ApplyScope::All,
             scope_vystup: ApplyScope::All,
             scope_rename: ApplyScope::All,
             right_panel_open: true,
@@ -333,17 +542,26 @@ impl App {
     }
 
     fn add_files(&mut self, paths: Vec<PathBuf>) {
+        let mut added: Vec<PathBuf> = Vec::new();
         for p in paths {
             if is_image(&p) {
                 if !self.per_file.contains_key(&p) {
                     self.per_file.insert(p.clone(), FileState::default());
+                    added.push(p.clone());
                 }
-                self.files.push(p);
+                if !self.files.contains(&p) {
+                    self.files.push(p);
+                }
             }
         }
         self.files.sort();
         if self.selected.is_none() && !self.files.is_empty() {
             self.selected = Some(0);
+        }
+
+        // background prewarm disk cache thumbnails (jen pro nově přidané)
+        if !added.is_empty() {
+            self.start_prewarm(added);
         }
     }
     fn add_folder_recursively(&mut self, folder: &Path) {
@@ -359,6 +577,46 @@ impl App {
         }
         self.add_files(list);
     }
+
+fn start_prewarm(&mut self, paths: Vec<PathBuf>) {
+    use rayon::prelude::*;
+
+    // pokud už běží, necháme doběhnout (jednoduchost)
+    if self.prewarm_running {
+        return;
+    }
+
+    self.prewarm_total = paths.len();
+    self.prewarm_done.store(0, Ordering::Relaxed);
+    self.prewarm_running = true;
+
+    let done = self.prewarm_done.clone();
+
+    // IO-heavy → netlačit na disk: omezíme paralelismus (typicky 2–4 je optimum)
+    let workers = 4usize.min(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)).max(1);
+
+    std::thread::spawn(move || {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(workers).build();
+        let run = || {
+            paths.par_iter().for_each(|p| {
+                let key = ThumbKey::from_path(p);
+                if load_disk_cached_thumb(&key).is_none() {
+                    if let Ok(img) = image::open(p) {
+                        let rgba = img.to_rgba8();
+                        save_disk_cached_thumb(&key, &rgba);
+                    }
+                }
+                done.fetch_add(1, Ordering::Relaxed);
+            });
+        };
+        if let Ok(pool) = pool {
+            pool.install(run);
+        } else {
+            run();
+        }
+    });
+}
+
     fn insert_files_at(&mut self, index: usize, paths: Vec<PathBuf>) {
         // Vyfiltruj jen obrázky, zamez duplicitám a udrž stabilní pořadí bloku
         let mut new_paths: Vec<PathBuf> = paths
@@ -387,6 +645,14 @@ impl App {
         }
     }
     fn update_job_status(&mut self) {
+        // prewarm dokončen? (thread nemá přístup k &mut self, takže to hlídáme tady)
+        if self.prewarm_running && self.prewarm_total > 0 {
+            let d = self.prewarm_done.load(Ordering::Relaxed);
+            if d >= self.prewarm_total {
+                self.prewarm_running = false;
+            }
+        }
+
         if let Some(job) = self.job.take() {
             let job = job;
             let mut keep = true;
@@ -422,6 +688,7 @@ impl App {
     fn targets_from(&self, start_idx: usize, scope: ApplyScope) -> Vec<usize> {
         let n = self.files.len();
         match scope {
+            ApplyScope::OnlyThis => vec![start_idx],
             ApplyScope::All => (0..n).collect(),
             ApplyScope::FromHere => (start_idx..n).collect(),
             ApplyScope::EveryOther => (0..n).filter(|i| i % 2 == 0).collect(),
@@ -588,6 +855,20 @@ impl App {
         }
     }
 
+    fn apply_split(&mut self, from_idx: usize, scope: ApplyScope) {
+        let src_p = self.files[from_idx].clone();
+        let src = self.state_for(&src_p).cloned().unwrap_or_default().params;
+
+        let targets = self.targets_from(from_idx, scope);
+        for i in targets {
+            let p = self.files[i].clone();
+            let st = self.state_mut_for(&p);
+            st.params.split_enabled = src.split_enabled;
+            st.params.split_x_top_norm = src.split_x_top_norm;
+            st.params.split_x_bottom_norm = src.split_x_bottom_norm;
+        }
+    }
+
     fn scale_rect_between(
         src_rect: egui::Rect,
         src_wh: [u32; 2],
@@ -661,6 +942,58 @@ impl App {
         }
     }
 
+
+/// Vrátí miniaturu pro seznam souborů (rychlá, z disk cache `cache/thumb`).
+fn thumb_texture(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+    let key = ThumbKey::from_path(path);
+
+    if let Some(tex) = self.thumb_cache.get(&key).cloned() {
+        return Some(tex);
+    }
+
+    // 1) disk cache
+    let color = if let Some(c) = load_disk_cached_thumb(&key) {
+        c
+    } else {
+        // 2) rychlý decode + resize a uložit do disk cache
+        let img = image::open(path).ok()?;
+        let rgba = img.to_rgba8();
+        save_disk_cached_thumb(&key, &rgba);
+
+        // znovu načti z RAM (nepovinné), tady rovnou vytvoříme ColorImage z "rgba" (už je malé / nebo se zmenší uvnitř save)
+        // pro UI použijeme rovnou zmenšený buffer stejně jako v save
+        let max_dim: u32 = 512;
+        let (w, h) = (rgba.width(), rgba.height());
+        let thumb = if w.max(h) > max_dim {
+            let (nw, nh) = if w >= h {
+                (max_dim, ((h as f32) * (max_dim as f32) / (w as f32)).round().max(1.0) as u32)
+            } else {
+                (((w as f32) * (max_dim as f32) / (h as f32)).round().max(1.0) as u32, max_dim)
+            };
+            image::imageops::resize(&rgba, nw, nh, image::imageops::FilterType::Triangle)
+        } else {
+            rgba
+        };
+
+        ColorImage::from_rgba_unmultiplied(
+            [thumb.width() as usize, thumb.height() as usize],
+            thumb.as_raw(),
+        )
+    };
+
+    let tag = format!("thumb-{}", self.thumb_order.len());
+    let tex = ctx.load_texture(tag, color, Default::default());
+
+    self.thumb_cache.insert(key.clone(), tex.clone());
+    self.thumb_order.push_back(key);
+    if self.thumb_order.len() > self.thumb_capacity {
+        if let Some(old) = self.thumb_order.pop_front() {
+            self.thumb_cache.remove(&old);
+        }
+    }
+    Some(tex)
+}
+
     /// Vytvoří / vrátí náhled (rotovaný, neořezaný). Uloží rozměr do per-file stavu.
     fn preview_texture(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
         let params_snapshot = self
@@ -674,9 +1007,28 @@ impl App {
             self.state_mut_for(path).last_preview_img_size = Some([sz.x as u32, sz.y as u32]);
             return Some(tex);
         }
+        // Disk cache (rychlý start po opětovném spuštění)
+        if let Some(color) = load_disk_cached_color_image(&key) {
+            let tag = format!("preview-disk-{}", self.cache_order.len());
+            let tex = ctx.load_texture(tag, color, Default::default());
+            let sz = tex.size_vec2();
+            self.state_mut_for(path).last_preview_img_size = Some([sz.x as u32, sz.y as u32]);
+            self.cache.insert(key.clone(), tex.clone());
+            self.cache_order.push_back(key);
+            if self.cache_order.len() > self.cache_capacity {
+                if let Some(old) = self.cache_order.pop_front() {
+                    self.cache.remove(&old);
+                }
+            }
+            return Some(tex);
+        }
+
+
 
         let img = image::open(path).ok()?;
         let (rot_rgba, _thr) = make_rotated_rgba(&img, &params_snapshot);
+        // uložit do disk cache (PNG thumbnail)
+        save_disk_cached_rgba(&key, &rot_rgba);
         let color = ColorImage::from_rgba_unmultiplied(
             [rot_rgba.width() as usize, rot_rgba.height() as usize],
             rot_rgba.as_raw(),
@@ -748,6 +1100,17 @@ impl App {
             params: Params,
             crop_norm: Option<(f32, f32, f32, f32)>,
             out_base: Option<String>,
+
+            // Page splitting
+            split_side: Option<SplitSide>,
+            split_x_top_norm: f32,
+            split_x_bottom_norm: f32,
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum SplitSide {
+            Left,
+            Right,
         }
         let mut tasks: Vec<Task> = Vec::with_capacity(files.len());
         for (idx, p) in files.iter().enumerate() {
@@ -778,12 +1141,60 @@ impl App {
                 None
             };
 
-            tasks.push(Task {
-                path: p.clone(),
-                params: st.params,
-                crop_norm,
-                out_base,
-            });
+            // If splitting is enabled, create two output tasks (left/right).
+            if st.params.split_enabled {
+                let split_top = st.params.split_x_top_norm.clamp(0.05, 0.95);
+                let split_bottom = st.params.split_x_bottom_norm.clamp(0.05, 0.95);
+                let split = ((split_top + split_bottom) * 0.5).clamp(0.05, 0.95);
+
+                // Remap optional crop rect from full image to each half.
+                let remap_crop = |c: Option<(f32, f32, f32, f32)>, x0: f32, x1: f32| -> Option<(f32, f32, f32, f32)> {
+                    let (nx, ny, nw, nh) = c?;
+                    let a0 = nx;
+                    let a1 = (nx + nw).min(1.0);
+                    let ix0 = a0.max(x0);
+                    let ix1 = a1.min(x1);
+                    if ix1 <= ix0 {
+                        return None;
+                    }
+                    let new_x = (ix0 - x0) / (x1 - x0);
+                    let new_w = (ix1 - ix0) / (x1 - x0);
+                    Some((new_x, ny, new_w, nh))
+                };
+
+                // base names: either rename mask or original stem.
+                let base_l = out_base.as_ref().map(|b| format!("{b}_L"));
+                let base_r = out_base.as_ref().map(|b| format!("{b}_R"));
+
+                tasks.push(Task {
+                    path: p.clone(),
+                    params: st.params.clone(),
+                    crop_norm: remap_crop(crop_norm, 0.0, split),
+                    out_base: base_l,
+                    split_side: Some(SplitSide::Left),
+                    split_x_top_norm: split_top,
+                    split_x_bottom_norm: split_bottom,
+                });
+                tasks.push(Task {
+                    path: p.clone(),
+                    params: st.params,
+                    crop_norm: remap_crop(crop_norm, split, 1.0),
+                    out_base: base_r,
+                    split_side: Some(SplitSide::Right),
+                    split_x_top_norm: split_top,
+                    split_x_bottom_norm: split_bottom,
+                });
+            } else {
+                tasks.push(Task {
+                    path: p.clone(),
+                    params: st.params,
+                    crop_norm,
+                    out_base,
+                    split_side: None,
+                    split_x_top_norm: 0.5,
+            split_x_bottom_norm: 0.5,
+                });
+            }
         }
 
         let (tx, rx) = mpsc::channel();
@@ -795,119 +1206,228 @@ impl App {
             let _ = tx.send(JobEvent::Started(total));
             let mut done = 0usize;
 
-            for (i, t) in tasks.into_iter().enumerate() {
-                if *cancel_clone.lock().unwrap() {
-                    let _ = tx.send(JobEvent::Error("Zrušeno".into()));
-                    return;
+
+use std::collections::BTreeMap;
+
+// Seskup úlohy podle zdrojového souboru, abychom při splitu nedekódovali 2×
+let mut groups: BTreeMap<PathBuf, Vec<Task>> = BTreeMap::new();
+for t in tasks {
+    groups.entry(t.path.clone()).or_default().push(t);
+}
+
+let mut i = 0usize;
+for (_path, group) in groups {
+    if *cancel_clone.lock().unwrap() {
+        let _ = tx.send(JobEvent::Error("Zrušeno".into()));
+        return;
+    }
+
+    // načti zdroj jednou
+    let src_path = group[0].path.clone();
+    let src_bytes = std::fs::read(&src_path).ok();
+    let img = match image::open(&src_path) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = tx.send(JobEvent::Error(format!("nelze otevřít {}: {e}", src_path.display())));
+            return;
+        }
+    };
+
+    // Pokud se parametry v rámci stejného souboru liší, fallback na původní (bez sdílení decode)
+    let same_params = group.iter().all(|t| t.params == group[0].params);
+
+    // Sdílený rotovaný obraz (největší úspora pro split L/R)
+    let shared_rot = if same_params {
+        let (rot, _thr) = make_rotated_rgba(&img, &group[0].params);
+        Some(rot)
+    } else {
+        None
+    };
+
+    for t in group.into_iter() {
+        i += 1;
+        if *cancel_clone.lock().unwrap() {
+            let _ = tx.send(JobEvent::Error("Zrušeno".into()));
+            return;
+        }
+
+        let _ = tx.send(JobEvent::Progress(i, total, t.path.clone()));
+
+        let res = (|| -> Result<()> {
+            // Rotovaný RGBA (neořezaný)
+            let mut rot_rgba = if let Some(ref rot) = shared_rot {
+                rot.clone()
+            } else {
+                let (rot, _thr) = make_rotated_rgba(&img, &t.params);
+                rot
+            };
+
+            // Optional page split (two-page scan): crop to left/right half first.
+            if let Some(side) = t.split_side {
+                let rw = rot_rgba.width();
+                let rh = rot_rgba.height();
+
+                let x_top = (t.split_x_top_norm.clamp(0.05, 0.95) * (rw as f32)).round();
+                let x_bottom = (t.split_x_bottom_norm.clamp(0.05, 0.95) * (rw as f32)).round();
+                let denom = (rh.saturating_sub(1)).max(1) as f32;
+
+                // Determine maximal needed output width for each side (slanted axis).
+                let mut max_left: u32 = 1;
+                let mut max_right: u32 = 1;
+                for y in 0..rh {
+                    let ty = (y as f32) / denom;
+                    let mut x = (x_top + (x_bottom - x_top) * ty).round() as i32;
+                    x = x.clamp(1, (rw as i32) - 1);
+                    let xu = x as u32;
+                    max_left = max_left.max(xu);
+                    max_right = max_right.max(rw - xu);
                 }
 
-                let res = (|| -> Result<()> {
-                    let src_bytes = std::fs::read(&t.path).ok();
-                    let img = image::open(&t.path)
-                        .with_context(|| format!("nelze otevřít {}", t.path.display()))?;
+                rot_rgba = match side {
+                    SplitSide::Left => {
+                        let mut out = RgbaImage::from_pixel(max_left, rh, Rgba([255, 255, 255, 255]));
+                        for y in 0..rh {
+                            let ty = (y as f32) / denom;
+                            let mut x = (x_top + (x_bottom - x_top) * ty).round() as i32;
+                            x = x.clamp(1, (rw as i32) - 1);
+                            let xu = x as u32;
 
-                    // Rotovaný RGBA (neořezaný)
-                    let (mut rot_rgba, _thr) = make_rotated_rgba(&img, &t.params);
-                    let rot_rgba_uncropped = rot_rgba.clone();
+                            for xx in 0..xu {
+                                let px = *rot_rgba.get_pixel(xx, y);
+                                out.put_pixel(xx, y, px);
+                            }
+                        }
+                        out
+                    }
+                    SplitSide::Right => {
+                        let mut out = RgbaImage::from_pixel(max_right, rh, Rgba([255, 255, 255, 255]));
+                        for y in 0..rh {
+                            let ty = (y as f32) / denom;
+                            let mut x = (x_top + (x_bottom - x_top) * ty).round() as i32;
+                            x = x.clamp(1, (rw as i32) - 1);
+                            let xu = x as u32;
 
-                    // Ruční/auto ořez
-                    let crop_xywh = if let Some((nx, ny, nw, nh)) = t.crop_norm {
-                        let rw = rot_rgba.width();
-                        let rh = rot_rgba.height();
-                        let mut x = (nx * rw as f32).round().clamp(0.0, rw.saturating_sub(1) as f32) as u32;
-                        let mut y = (ny * rh as f32).round().clamp(0.0, rh.saturating_sub(1) as f32) as u32;
-                        let mut w = (nw * rw as f32).round() as u32;
-                        let mut h = (nh * rh as f32).round() as u32;
-                        if w == 0 { w = 1; }
-                        if h == 0 { h = 1; }
-                        x = x.min(rw.saturating_sub(1));
-                        y = y.min(rh.saturating_sub(1));
-                        w = w.min(rw.saturating_sub(x));
-                        h = h.min(rh.saturating_sub(y));
+                            let w = rw - xu;
+                            for xx in 0..w {
+                                let px = *rot_rgba.get_pixel(xu + xx, y);
+                                out.put_pixel(xx, y, px);
+                            }
+                        }
+                        out
+                    }
+                };
+            }
+
+            // Ruční/auto ořez
+            let crop_xywh = if let Some((nx, ny, nw, nh)) = t.crop_norm {
+                let rw = rot_rgba.width();
+                let rh = rot_rgba.height();
+                let mut x = (nx * rw as f32).round().clamp(0.0, rw.saturating_sub(1) as f32) as u32;
+                let mut y = (ny * rh as f32).round().clamp(0.0, rh.saturating_sub(1) as f32) as u32;
+                let mut w = (nw * rw as f32).round() as u32;
+                let mut h = (nh * rh as f32).round() as u32;
+                if w == 0 { w = 1; }
+                if h == 0 { h = 1; }
+                x = x.min(rw.saturating_sub(1));
+                y = y.min(rh.saturating_sub(1));
+                w = w.min(rw.saturating_sub(x));
+                h = h.min(rh.saturating_sub(y));
+                (x, y, w, h)
+            } else {
+                // Auto detekce hran stránky: preferuj „světlý papír na tmavém pozadí“
+                let rotated_gray = DynamicImage::ImageRgba8(rot_rgba.clone()).to_luma8();
+                if let Some((x, y, w, h)) = detect_page_bbox_smart(&rotated_gray) {
+                    (x, y, w, h)
+                } else {
+                    // fallback na obsah (tmavé pixely)
+                    let thr = otsu_level(&rotated_gray);
+                    let mask = threshold_to_mask(&rotated_gray, thr);
+                    if let Some((x, y, w, h)) = content_bbox(&mask) {
                         (x, y, w, h)
                     } else {
-                        // Auto detekce hran stránky: preferuj „světlý papír na tmavém pozadí“
-                        let rotated_gray = DynamicImage::ImageRgba8(rot_rgba.clone()).to_luma8();
-                        if let Some((x, y, w, h)) = detect_page_bbox_smart(&rotated_gray) {
-                            (x, y, w, h)
-                        } else {
-                            // fallback na obsah (tmavé pixely)
-                            let thr = otsu_level(&rotated_gray);
-                            let mask = threshold_to_mask(&rotated_gray, thr);
-                            if let Some((x, y, w, h)) = content_bbox(&mask) {
-                                (x, y, w, h)
-                            } else {
-                                (0, 0, rot_rgba.width(), rot_rgba.height())
-                            }
-                        }
-                    };
-
-                    let (x, y, w, h) = crop_xywh;
-                    rot_rgba = image::imageops::crop_imm(&rot_rgba, x, y, w, h).to_image();
-
-                    // Okraj v px
-                    let px_from_mm = |mm: f32, dpi: u32| -> u32 {
-                        let px = (mm / 25.4) * dpi as f32;
-                        px.round().max(0.0) as u32
-                    };
-                    let margin_px: u32 = match t.params.margin_units {
-                        MarginUnits::Px => t.params.margin_amount.max(0.0).round() as u32,
-                        MarginUnits::Mm => {
-                            let dpi = t.params.dpi.unwrap_or(300);
-                            px_from_mm(t.params.margin_amount.max(0.0), dpi)
-                        }
-                    };
-
-                    // Aplikace okraje
-                    let out = if margin_px > 0 {
-                        match t.params.margin_source {
-                            MarginSource::Artificial => {
-                                add_margin_rgba(&rot_rgba, margin_px, Rgba(t.params.margin_color))
-                            }
-                            MarginSource::FromOriginal => {
-                                add_margin_rgba_from_original(
-                                    &rot_rgba_uncropped,
-                                    (x, y, w, h),
-                                    margin_px,
-                                )
-                            }
-                        }
-                    } else {
-                        rot_rgba
-                    };
-
-                    // Ulož
-                    let base = if let Some(ref b) = t.out_base {
-                        b.clone()
-                    } else {
-                        t.path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("out")
-                            .to_string()
-                    };
-                    let out_path = unique_out_path(&outdir, &base, t.params.out_format.as_ext());
-                    save_image_with_metadata(
-                        &DynamicImage::ImageRgba8(out),
-                        &out_path,
-                        &t.params,
-                        src_bytes.as_deref(),
-                    )
-                    .with_context(|| format!("ukládám {}", out_path.display()))?;
-                    Ok(())
-                })();
-
-                match res {
-                    Ok(()) => {
-                        done += 1;
-                        let _ = tx.send(JobEvent::Progress(i + 1, total, t.path));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(JobEvent::Error(format!("{}", e)));
-                        return;
+                        (0, 0, rot_rgba.width(), rot_rgba.height())
                     }
                 }
+            };
+
+            let (x, y, w, h) = crop_xywh;
+            let rot_rgba_uncropped = rot_rgba.clone(); // jen pro margin from original, je to už po splitu (pokud je)
+            rot_rgba = image::imageops::crop_imm(&rot_rgba, x, y, w, h).to_image();
+
+            // Okraj v px
+            let px_from_mm = |mm: f32, dpi: u32| -> u32 {
+                let px = (mm / 25.4) * dpi as f32;
+                px.round().max(0.0) as u32
+            };
+            let margin_px: u32 = match t.params.margin_units {
+                MarginUnits::Px => t.params.margin_amount.max(0.0).round() as u32,
+                MarginUnits::Mm => {
+                    let dpi = t.params.dpi.unwrap_or(300);
+                    px_from_mm(t.params.margin_amount.max(0.0), dpi)
+                }
+            };
+
+            // Aplikace okraje
+            let out = if margin_px > 0 {
+                match t.params.margin_source {
+                    MarginSource::Artificial => {
+                        add_margin_rgba(&rot_rgba, margin_px, Rgba(t.params.margin_color))
+                    }
+                    MarginSource::FromOriginal => {
+                        add_margin_rgba_from_original(
+                            &rot_rgba_uncropped,
+                            (x, y, w, h),
+                            margin_px,
+                        )
+                    }
+                }
+            } else {
+                rot_rgba
+            };
+
+            // Ulož
+            let mut base = if let Some(ref b) = t.out_base {
+                b.clone()
+            } else {
+                t.path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("out")
+                    .to_string()
+            };
+            // If this is a split subpage and caller didn't provide a custom base, add a suffix.
+            if t.out_base.is_none() {
+                if let Some(side) = t.split_side {
+                    base = match side {
+                        SplitSide::Left => format!("{base}_L"),
+                        SplitSide::Right => format!("{base}_R"),
+                    };
+                }
             }
+            let out_path = unique_out_path(&outdir, &base, t.params.out_format.as_ext());
+            save_image_with_metadata(
+                &DynamicImage::ImageRgba8(out),
+                &out_path,
+                &t.params,
+				&t.path,
+                src_bytes.as_deref(),
+            )?;
+
+            Ok(())
+        })();
+
+        match res {
+            Ok(()) => done += 1,
+            Err(e) => {
+                let _ = tx.send(JobEvent::Error(format!(
+                    "{}: {}",
+                    t.path.display(),
+                    e
+                )));
+            }
+        }
+    }
+}
             let _ = tx.send(JobEvent::Done(done));
         });
 
@@ -955,6 +1475,17 @@ impl eframe::App for App {
                     self.files.clear();
                     self.selected = None;
                 }
+
+                // stav disk cache prewarm
+                if self.prewarm_running {
+                    use std::sync::atomic::Ordering;
+                    let done = self.prewarm_done.load(Ordering::Relaxed);
+                    ui.label(format!("Cache: {}/{}", done, self.prewarm_total));
+                    if done >= self.prewarm_total {
+                        self.prewarm_running = false;
+                    }
+                }
+
                 ui.separator();
                 // světle modré tlačítko „Výstupní složka…“
                 let light_blue = egui::Color32::from_rgb(180, 210, 255);
@@ -1072,6 +1603,7 @@ impl eframe::App for App {
                     let mut scope_narovnani_local = self.scope_narovnani;
                     let mut scope_okraje_local    = self.scope_okraje;
                     let mut scope_orez_local      = self.scope_orez;
+                    let mut scope_split_local     = self.scope_split;
                     let mut scope_vystup_local    = self.scope_vystup;
                     let mut scope_rename_local    = self.scope_rename;
 
@@ -1079,6 +1611,7 @@ impl eframe::App for App {
                     let mut do_apply_narovnani = false;
                     let mut do_apply_okraje    = false;
                     let mut do_apply_orez      = false;
+                    let mut do_apply_split     = false;
                     let mut do_apply_vystup    = false;
                     let mut do_apply_rename    = false;
 
@@ -1087,6 +1620,59 @@ impl eframe::App for App {
 
                     ui.add_enabled_ui(controls_enabled, |ui| {
                         if let Some(p) = selected_path.as_ref() {
+
+                            // ========== Rozdělení skenu (dvoustrana) ==========
+                            // Umístěno mezi Zoom a Rotace (podle UX požadavku).
+                            {
+                                let st = self.state_mut_for(p);
+                                ui.heading("Rozdělení (L/P)");
+
+                                let resp = ui.checkbox(&mut st.params.split_enabled, "Rozdělit sken na levou/pravou stránku");
+                                if resp.changed() && st.params.split_enabled {
+                                    // Auto-detect divider when enabling.
+                                    if let Some(x) = detect_split_x_norm(p, &st.params) {
+                                        st.params.split_x_top_norm = x;
+                                        st.params.split_x_bottom_norm = x;
+                                    }
+                                }
+
+                                if st.params.split_enabled {
+                                    ui.add(
+                                        egui::Slider::new(&mut st.params.split_x_top_norm, 0.05..=0.95)
+                                            .text("Osa nahoře (X)")
+                                            .clamping(egui::SliderClamping::Always),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(&mut st.params.split_x_bottom_norm, 0.05..=0.95)
+                                            .text("Osa dole (X)")
+                                            .clamping(egui::SliderClamping::Always),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Detekovat znovu").clicked() {
+                                            if let Some(x) = detect_split_x_norm(p, &st.params) {
+                                                st.params.split_x_top_norm = x;
+                                        st.params.split_x_bottom_norm = x;
+                                            }
+                                        }
+                                        ui.label("Tip: Střed můžeš také přetáhnout v náhledu.");
+                                    });
+                                }
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label("Aplikovat na…");
+                                egui::ComboBox::from_id_salt("scope_split")
+                                    .selected_text(scope_split_local.label())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut scope_split_local, ApplyScope::OnlyThis,           ApplyScope::OnlyThis.label());
+                                        ui.selectable_value(&mut scope_split_local, ApplyScope::All,                ApplyScope::All.label());
+                                        ui.selectable_value(&mut scope_split_local, ApplyScope::FromHere,           ApplyScope::FromHere.label());
+                                        ui.selectable_value(&mut scope_split_local, ApplyScope::EveryOther,         ApplyScope::EveryOther.label());
+                                        ui.selectable_value(&mut scope_split_local, ApplyScope::EveryOtherFromHere, ApplyScope::EveryOtherFromHere.label());
+                                    });
+                                if ui.button("Aplikovat").clicked() { do_apply_split = true; }
+                            });
+
+                            ui.separator();
 
                             // ========== Rotace ==========
                             {
@@ -1125,6 +1711,7 @@ impl eframe::App for App {
                                 egui::ComboBox::from_id_salt("scope_rotace")
                                     .selected_text(scope_rotace_local.label())
                                     .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut scope_rotace_local, ApplyScope::OnlyThis,           ApplyScope::OnlyThis.label());
                                         ui.selectable_value(&mut scope_rotace_local, ApplyScope::All,                ApplyScope::All.label());
                                         ui.selectable_value(&mut scope_rotace_local, ApplyScope::FromHere,           ApplyScope::FromHere.label());
                                         ui.selectable_value(&mut scope_rotace_local, ApplyScope::EveryOther,         ApplyScope::EveryOther.label());
@@ -1201,6 +1788,7 @@ impl eframe::App for App {
                                 egui::ComboBox::from_id_salt("scope_narovnani")
                                     .selected_text(scope_narovnani_local.label())
                                     .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut scope_narovnani_local, ApplyScope::OnlyThis,           ApplyScope::OnlyThis.label());
                                         ui.selectable_value(&mut scope_narovnani_local, ApplyScope::All,                ApplyScope::All.label());
                                         ui.selectable_value(&mut scope_narovnani_local, ApplyScope::FromHere,           ApplyScope::FromHere.label());
                                         ui.selectable_value(&mut scope_narovnani_local, ApplyScope::EveryOther,         ApplyScope::EveryOther.label());
@@ -1270,6 +1858,7 @@ impl eframe::App for App {
                                 egui::ComboBox::from_id_salt("scope_okraje")
                                     .selected_text(scope_okraje_local.label())
                                     .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut scope_okraje_local, ApplyScope::OnlyThis,           ApplyScope::OnlyThis.label());
                                         ui.selectable_value(&mut scope_okraje_local, ApplyScope::All,                ApplyScope::All.label());
                                         ui.selectable_value(&mut scope_okraje_local, ApplyScope::FromHere,           ApplyScope::FromHere.label());
                                         ui.selectable_value(&mut scope_okraje_local, ApplyScope::EveryOther,         ApplyScope::EveryOther.label());
@@ -1310,6 +1899,7 @@ impl eframe::App for App {
                                 egui::ComboBox::from_id_salt("scope_orez")
                                     .selected_text(scope_orez_local.label())
                                     .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut scope_orez_local, ApplyScope::OnlyThis,           ApplyScope::OnlyThis.label());
                                         ui.selectable_value(&mut scope_orez_local, ApplyScope::All,                ApplyScope::All.label());
                                         ui.selectable_value(&mut scope_orez_local, ApplyScope::FromHere,           ApplyScope::FromHere.label());
                                         ui.selectable_value(&mut scope_orez_local, ApplyScope::EveryOther,         ApplyScope::EveryOther.label());
@@ -1367,6 +1957,7 @@ impl eframe::App for App {
                                 egui::ComboBox::from_id_salt("scope_vystup")
                                     .selected_text(scope_vystup_local.label())
                                     .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut scope_vystup_local, ApplyScope::OnlyThis,           ApplyScope::OnlyThis.label());
                                         ui.selectable_value(&mut scope_vystup_local, ApplyScope::All,                ApplyScope::All.label());
                                         ui.selectable_value(&mut scope_vystup_local, ApplyScope::FromHere,           ApplyScope::FromHere.label());
                                         ui.selectable_value(&mut scope_vystup_local, ApplyScope::EveryOther,         ApplyScope::EveryOther.label());
@@ -1407,6 +1998,7 @@ impl eframe::App for App {
                                 egui::ComboBox::from_id_salt("scope_rename")
                                     .selected_text(scope_rename_local.label())
                                     .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut scope_rename_local, ApplyScope::OnlyThis,           ApplyScope::OnlyThis.label());
                                         ui.selectable_value(&mut scope_rename_local, ApplyScope::All,                ApplyScope::All.label());
                                         ui.selectable_value(&mut scope_rename_local, ApplyScope::FromHere,           ApplyScope::FromHere.label());
                                         ui.selectable_value(&mut scope_rename_local, ApplyScope::EveryOther,         ApplyScope::EveryOther.label());
@@ -1467,6 +2059,7 @@ impl eframe::App for App {
                     self.scope_narovnani = scope_narovnani_local;
                     self.scope_okraje    = scope_okraje_local;
                     self.scope_orez      = scope_orez_local;
+                    self.scope_split     = scope_split_local;
                     self.scope_vystup    = scope_vystup_local;
                     self.scope_rename    = scope_rename_local;
 
@@ -1475,6 +2068,7 @@ impl eframe::App for App {
                         if do_apply_narovnani { self.apply_narovnani(sel, self.scope_narovnani); }
                         if do_apply_okraje    { self.apply_okraje(sel,    self.scope_okraje); }
                         if do_apply_orez      { self.apply_orez(sel,      self.scope_orez); }
+                        if do_apply_split     { self.apply_split(sel,     self.scope_split); }
                         if do_apply_vystup    { self.apply_vystup(sel,    self.scope_vystup); }
                         if do_apply_rename    { self.apply_rename(sel,    self.scope_rename); }
                     }
@@ -1560,6 +2154,50 @@ impl eframe::App for App {
 
                     ui.separator();
 
+                    // --- Rozdělení (dvoustrana): náhled levé/pravé stránky ---
+                    if let Some(sel_idx) = self.selected {
+                        if let Some(p) = self.files.get(sel_idx).cloned() {
+                            let st = self.state_for(&p).cloned().unwrap_or_default();
+                            if st.params.split_enabled {
+                                if let Some(tex) = self.preview_texture(ui.ctx(), &p) {
+                                    let split_top = st.params.split_x_top_norm.clamp(0.05, 0.95);
+                let split_bottom = st.params.split_x_bottom_norm.clamp(0.05, 0.95);
+                let split = ((split_top + split_bottom) * 0.5).clamp(0.05, 0.95);
+                                    let tex_sz = tex.size_vec2();
+                                    let w = tex_sz.x.max(1.0);
+                                    let h = tex_sz.y.max(1.0);
+
+                                    ui.collapsing("Rozdělení (náhled)", |ui| {
+                                        let avail_w = ui.available_width().max(40.0);
+
+                                        // Levá
+                                        ui.label("Levá stránka");
+                                        let max_h = 360.0;
+                                        let left_w_px = (w * split).max(1.0);
+                                        let left_h_px = h.max(1.0);
+                                        let scale_l = (avail_w / left_w_px).min(max_h / left_h_px).max(0.01);
+                                        let draw_l = egui::vec2(left_w_px * scale_l, left_h_px * scale_l);
+                                        let uv_l = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(split, 1.0));
+                                        ui.add(egui::widgets::Image::new((tex.id(), draw_l)).uv(uv_l));
+
+                                        ui.separator();
+
+                                        // Pravá
+                                        ui.label("Pravá stránka");
+                                        let right_w_px = (w * (1.0 - split)).max(1.0);
+                                        let right_h_px = h.max(1.0);
+                                        let scale_r = (avail_w / right_w_px).min(max_h / right_h_px).max(0.01);
+                                        let draw_r = egui::vec2(right_w_px * scale_r, right_h_px * scale_r);
+                                        let uv_r = egui::Rect::from_min_max(egui::pos2(split, 0.0), egui::pos2(1.0, 1.0));
+                                        ui.add(egui::widgets::Image::new((tex.id(), draw_r)).uv(uv_r));
+                                    });
+
+                                    ui.separator();
+                                }
+                            }
+                        }
+                    }
+
                     // Připrav seznam předem, ať během kreslení nedržíme borrow na self.files
                     let filter_lc = self.file_filter.to_ascii_lowercase();
                     let files_to_show: Vec<(usize, PathBuf)> = self.files
@@ -1591,7 +2229,7 @@ impl eframe::App for App {
                                     ui.horizontal(|ui| {
                                         // Miniatura
                                         if self.show_thumbs {
-                                            if let Some(tex) = self.preview_texture(ui.ctx(), &p) {
+                                            if let Some(tex) = self.thumb_texture(ui.ctx(), &p) {
                                                 let tex_sz = tex.size_vec2();
                                                 let scale = (self.thumb_size / tex_sz.x.max(tex_sz.y)).max(0.01);
                                                 let draw = tex_sz * scale;
@@ -1686,9 +2324,15 @@ impl eframe::App for App {
                 self.ensure_auto_crop_rect_if_needed(&p);
 
                 if let Some(tex) = self.preview_texture(ui.ctx(), &p) {
-                    let (crop_enabled, mut crop_rect_img) = {
+                    let (crop_enabled, mut crop_rect_img, split_enabled, split_x_top_norm, split_x_bottom_norm) = {
                         let st_snapshot = self.state_for(&p).cloned().unwrap_or_default();
-                        (st_snapshot.crop_enabled, st_snapshot.crop_rect_img)
+                        (
+                            st_snapshot.crop_enabled,
+                            st_snapshot.crop_rect_img,
+                            st_snapshot.params.split_enabled,
+                            st_snapshot.params.split_x_top_norm,
+                            st_snapshot.params.split_x_bottom_norm,
+                        )
                     };
 
                     egui::ScrollArea::both()
@@ -1704,17 +2348,114 @@ impl eframe::App for App {
                             let painter = ui.painter_at(resp.rect);
 
                             // převody: screen <-> image
-                            let to_img = |screen: egui::Pos2| {
-                                let mut p = screen - resp.rect.min;
-                                p.x /= self.zoom;
-                                p.y /= self.zoom;
-                                p.x = p.x.clamp(0.0, tex_size.x);
-                                p.y = p.y.clamp(0.0, tex_size.y);
+                            // POZOR: closure nesmí sahat na `self`, jinak nejde později mutovat stav (borrow checker).
+                            let zoom = self.zoom;
+                            let rect_min = resp.rect.min;
+                            let tex_w = tex_size.x;
+                            let tex_h = tex_size.y;
+
+                            let to_img = move |screen: egui::Pos2| {
+                                let mut p = screen - rect_min;
+                                p.x /= zoom;
+                                p.y /= zoom;
+                                p.x = p.x.clamp(0.0, tex_w);
+                                p.y = p.y.clamp(0.0, tex_h);
                                 egui::pos2(p.x, p.y)
                             };
-                            let to_screen = |p_img: egui::Pos2| resp.rect.min + p_img.to_vec2() * self.zoom;
 
-                            if crop_enabled && crop_rect_img.is_none() {
+                            let to_screen =
+                                move |p_img: egui::Pos2| rect_min + p_img.to_vec2() * zoom;
+
+                            // ===== Page splitting divider (drag to adjust) =====
+                            if split_enabled {
+                                let line_color = egui::Color32::from_rgb(220, 200, 80);
+
+                                let x_top_img = (split_x_top_norm.clamp(0.05, 0.95) * tex_size.x).clamp(0.0, tex_size.x);
+                                let x_bottom_img = (split_x_bottom_norm.clamp(0.05, 0.95) * tex_size.x).clamp(0.0, tex_size.x);
+
+                                let top_pt = to_screen(egui::pos2(x_top_img, 0.0));
+                                let bottom_pt = to_screen(egui::pos2(x_bottom_img, tex_size.y));
+
+                                painter.line_segment(
+                                    [top_pt, bottom_pt],
+                                    egui::Stroke::new(2.0, line_color),
+                                );
+
+                                // small handles (top/bottom) to hint independent movement
+                                painter.circle_filled(top_pt, 4.0, line_color);
+                                painter.circle_filled(bottom_pt, 4.0, line_color);
+
+                                // Handle hover + drag (keep it simple, independent of crop handles)
+                                let split_band_px = 10.0_f32;
+                                let mut hover = false;
+                                if let Some(pointer) = resp.hover_pos() {
+                                    let denom = (bottom_pt.y - top_pt.y).max(1.0);
+                                    let ty = ((pointer.y - top_pt.y) / denom).clamp(0.0, 1.0);
+                                    let x_line = top_pt.x + (bottom_pt.x - top_pt.x) * ty;
+
+                                    if (pointer.x - x_line).abs() <= split_band_px {
+                                        hover = true;
+                                        ui.output_mut(|o| o.cursor_icon = CursorIcon::ResizeColumn);
+                                    }
+                                }
+                                if resp.drag_started() && hover {
+                                    self.split_dragging = true;
+
+                                    // decide which part of the axis we're dragging
+                                    if let Some(pointer) = resp.interact_pointer_pos() {
+                                        let denom = (bottom_pt.y - top_pt.y).max(1.0);
+                                        let ty = ((pointer.y - top_pt.y) / denom).clamp(0.0, 1.0);
+                                        self.split_drag_kind = if ty <= 0.25 {
+                                            SplitDragKind::Top
+                                        } else if ty >= 0.75 {
+                                            SplitDragKind::Bottom
+                                        } else {
+                                            SplitDragKind::Both
+                                        };
+                                    } else {
+                                        self.split_drag_kind = SplitDragKind::Both;
+                                    }
+
+                                    // prevent crop drag from latching in the same gesture
+                                    self.drag_handle = None;
+                                    self.drag_origin_rect = None;
+                                    self.drag_start_mouse_img = None;
+                                    self.drag_aspect = None;
+                                }
+                                if self.split_dragging && resp.dragged() {
+                                    if let Some(pointer) = resp.interact_pointer_pos() {
+                                        let p_img = to_img(pointer);
+                                        let y_norm = (p_img.y / tex_size.y).clamp(0.0, 1.0);
+                                        let new_norm = (p_img.x / tex_size.x).clamp(0.05, 0.95);
+                                        let drag_kind = self.split_drag_kind;
+
+                                        let st = self.state_mut_for(&p);
+                                        let cur_top = st.params.split_x_top_norm;
+                                        let cur_bottom = st.params.split_x_bottom_norm;
+                                        let cur_at_y = cur_top + (cur_bottom - cur_top) * y_norm;
+
+                                        match drag_kind {
+                                            SplitDragKind::Top => {
+                                                st.params.split_x_top_norm = new_norm;
+                                            }
+                                            SplitDragKind::Bottom => {
+                                                st.params.split_x_bottom_norm = new_norm;
+                                            }
+                                            SplitDragKind::Both => {
+                                                let delta = new_norm - cur_at_y;
+                                                st.params.split_x_top_norm = (cur_top + delta).clamp(0.05, 0.95);
+                                                st.params.split_x_bottom_norm = (cur_bottom + delta).clamp(0.05, 0.95);
+                                            }
+                                        }
+                                    }
+                                }
+                                if self.split_dragging && resp.drag_stopped() {
+                                    self.split_dragging = false;
+                                    self.split_drag_kind = SplitDragKind::Both;
+                                }
+                            }
+
+if crop_enabled && crop_rect_img.is_none() {
                                 crop_rect_img = Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), tex_size));
                             }
 
@@ -2595,6 +3336,59 @@ fn auto_crop_rect_for_with_params(path: &Path, params: &Params) -> Option<egui::
     })
 }
 
+/// Heuristic splitter for two-page scans: finds a likely gutter position near the middle.
+/// Returns X in normalized coordinates (0..1) of the rotated image.
+fn detect_split_x_norm(path: &Path, params: &Params) -> Option<f32> {
+    let img = image::open(path).ok()?;
+    let (rot_rgba, _thr) = make_rotated_rgba(&img, params);
+    let (w, h) = rot_rgba.dimensions();
+    if w < 64 || h < 64 {
+        return Some(0.5);
+    }
+
+    // Downsample by stepping pixels – fast and good enough.
+    let step_x: u32 = (w / 800).max(1);
+    let step_y: u32 = (h / 800).max(1);
+
+    // Search only around the center.
+    let x0 = (w as f32 * 0.30) as u32;
+    let x1 = (w as f32 * 0.70) as u32;
+    if x1 <= x0 + 4 {
+        return Some(0.5);
+    }
+
+    // Score each candidate column by average brightness (gutter tends to be bright/low ink).
+    // We take the MAX brightness.
+    let mut best_x = (w / 2).max(1);
+    let mut best_score: f32 = -1.0;
+
+    for x in (x0..=x1).step_by(step_x as usize) {
+        let mut sum: u64 = 0;
+        let mut cnt: u64 = 0;
+        // Ignore top/bottom margins a bit.
+        let y_start = (h as f32 * 0.08) as u32;
+        let y_end   = (h as f32 * 0.92) as u32;
+        for y in (y_start..=y_end).step_by(step_y as usize) {
+            let p = rot_rgba.get_pixel(x.min(w - 1), y.min(h - 1));
+            // integer luma approx (BT.709-ish)
+            let r = p[0] as u32;
+            let g = p[1] as u32;
+            let b = p[2] as u32;
+            let l = (2126 * r + 7152 * g + 722 * b) / 10000;
+            sum += l as u64;
+            cnt += 1;
+        }
+        if cnt == 0 { continue; }
+        let avg = (sum as f32) / (cnt as f32);
+        if avg > best_score {
+            best_score = avg;
+            best_x = x;
+        }
+    }
+
+    Some((best_x as f32 / (w as f32)).clamp(0.05, 0.95))
+}
+
 // ===== Uložení s metadaty, správná bitová hloubka =====
 fn rgba8_is_opaque(img: &RgbaImage) -> bool {
     img.pixels().all(|p| p[3] == 255)
@@ -2623,10 +3417,77 @@ fn add_margin_rgba_from_original(
     image::imageops::crop_imm(rotated_uncropped, x0, y0, w2, h2).to_image()
 }
 
+
+#[derive(Default, Debug, Clone)]
+struct TiffMeta {
+    icc_profile: Option<Vec<u8>>,
+    xmp: Option<Vec<u8>>,
+}
+
+fn extract_tiff_meta(path: &Path) -> Option<TiffMeta> {
+    use std::fs::File;
+    use std::io::BufReader;
+    use tiff::decoder::Decoder;
+    use tiff::tags::Tag;
+
+    let f = File::open(path).ok()?;
+    let mut dec = Decoder::new(BufReader::new(f)).ok()?;
+
+    let mut meta = TiffMeta::default();
+
+    // ICC profile: TIFF tag 34675
+    if let Ok(Some(v)) = dec.find_tag(Tag::IccProfile) {
+        if let Ok(bytes) = v.into_u8_vec() {
+            if !bytes.is_empty() {
+                meta.icc_profile = Some(bytes);
+            }
+        }
+    }
+
+    // XMP: TIFF tag 700 (Adobe XMP packet)
+    // Older tiff crate versions may not have a dedicated Tag variant, Unknown(700) works.
+    if let Ok(Some(v)) = dec.find_tag(Tag::Unknown(700)) {
+        if let Ok(bytes) = v.into_u8_vec() {
+            if !bytes.is_empty() {
+                meta.xmp = Some(bytes);
+            }
+        }
+    }
+
+    if meta.icc_profile.is_some() || meta.xmp.is_some() {
+        Some(meta)
+    } else {
+        None
+    }
+}
+
+fn write_tiff_meta_tags<'a, W, C, K>(
+    imgw: &mut tiff::encoder::ImageEncoder<'a, W, C, K>,
+    meta: Option<&TiffMeta>,
+) where
+    W: std::io::Write + std::io::Seek,
+    // In tiff crate, ColorType is available via the colortype module.
+    C: tiff::encoder::colortype::ColorType,
+    K: tiff::encoder::TiffKind,
+{
+    use tiff::tags::Tag;
+
+    let Some(meta) = meta else { return; };
+
+    // In tiff >= 0.11, custom tags are written via the underlying DirectoryEncoder.
+    if let Some(ref icc) = meta.icc_profile {
+        let _ = imgw.encoder().write_tag(Tag::IccProfile, icc.as_slice());
+    }
+    if let Some(ref xmp) = meta.xmp {
+        let _ = imgw.encoder().write_tag(Tag::Unknown(700), xmp.as_slice());
+    }
+}
+
 fn save_image_with_metadata(
     img: &DynamicImage,
     path: &Path,
     params: &Params,
+    src_path: &Path,
     src_bytes: Option<&[u8]>,
 ) -> Result<()> {
     match params.out_format {
@@ -2765,6 +3626,12 @@ fn save_image_with_metadata(
             use tiff::encoder::{colortype, Rational, TiffEncoder};
             use tiff::tags::ResolutionUnit;
 
+            let tiff_meta = if !params.strip_metadata {
+                extract_tiff_meta(src_path)
+            } else {
+                None
+            };
+
             let file = File::create(path)?;
             let mut w = BufWriter::new(file);
             let mut enc = TiffEncoder::new(&mut w)?;
@@ -2773,6 +3640,7 @@ fn save_image_with_metadata(
                 DynamicImage::ImageLuma8(y) => {
                     let mut imgw = enc.new_image::<colortype::Gray8>(y.width(), y.height())?;
                     if let Some(dpi) = params.dpi { imgw.resolution(ResolutionUnit::Inch, Rational { n: dpi as u32, d: 1 }); }
+                    write_tiff_meta_tags(&mut imgw, tiff_meta.as_ref());
                     imgw.write_data(y.as_raw())?;
                 }
                 DynamicImage::ImageLumaA8(ya) => {
@@ -2792,6 +3660,7 @@ fn save_image_with_metadata(
                 DynamicImage::ImageRgb8(rgb) => {
                     let mut imgw = enc.new_image::<colortype::RGB8>(rgb.width(), rgb.height())?;
                     if let Some(dpi) = params.dpi { imgw.resolution(ResolutionUnit::Inch, Rational { n: dpi as u32, d: 1 }); }
+                    write_tiff_meta_tags(&mut imgw, tiff_meta.as_ref());
                     imgw.write_data(rgb.as_raw())?;
                 }
                 DynamicImage::ImageRgba8(rgba) => {
@@ -2809,11 +3678,13 @@ fn save_image_with_metadata(
                 DynamicImage::ImageLuma16(y16) => {
                     let mut imgw = enc.new_image::<colortype::Gray16>(y16.width(), y16.height())?;
                     if let Some(dpi) = params.dpi { imgw.resolution(ResolutionUnit::Inch, Rational { n: dpi as u32, d: 1 }); }
+                    write_tiff_meta_tags(&mut imgw, tiff_meta.as_ref());
                     imgw.write_data(y16.as_raw())?;
                 }
                 DynamicImage::ImageRgb16(rgb16) => {
                     let mut imgw = enc.new_image::<colortype::RGB16>(rgb16.width(), rgb16.height())?;
                     if let Some(dpi) = params.dpi { imgw.resolution(ResolutionUnit::Inch, Rational { n: dpi as u32, d: 1 }); }
+                    write_tiff_meta_tags(&mut imgw, tiff_meta.as_ref());
                     imgw.write_data(rgb16.as_raw())?;
                 }
                 DynamicImage::ImageRgba16(rgba16) => {
@@ -2833,6 +3704,7 @@ fn save_image_with_metadata(
                     let rgb = img.to_rgb8();
                     let mut imgw = enc.new_image::<colortype::RGB8>(rgb.width(), rgb.height())?;
                     if let Some(dpi) = params.dpi { imgw.resolution(ResolutionUnit::Inch, Rational { n: dpi as u32, d: 1 }); }
+                    write_tiff_meta_tags(&mut imgw, tiff_meta.as_ref());
                     imgw.write_data(rgb.as_raw())?;
                 }
             }
