@@ -13,7 +13,7 @@ ScanMower is a program written in pure Rust. It's basically a simplified version
 
 ## TO-DO
 - English localization.
-- Page splitting implementation.
+- Page splitting implementation. (Elementary implementation available in v0.2.0)
 - Code cleanup.
 - General and bug fixing.
 - Icon improvement.
@@ -21,12 +21,12 @@ ScanMower is a program written in pure Rust. It's basically a simplified version
   
 ## Dream features (ETA unknown; or never to be implemented)
 - Better image parameters preservation.
-- AI image processing using a custom mini LM?
+- AI image processing using a custom mini LM? (probably not)
 - Better non-AI auto image processing.
 - Page stitching (AI or non-AI implementation?).
   
 ## AI generetad code disclosure
-- The code is AI generetated using ChatGPT model 5.
+- The code is AI generetated using ChatGPT model 5.x.
 
 ## Screenshot
 <img width="1920" height="1040" alt="scanmower_0-1-0" src="https://github.com/user-attachments/assets/2e21908e-8734-4abd-b37d-1faa6a627a4f" />
