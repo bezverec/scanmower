@@ -1,7 +1,7 @@
-# ScanMower (Python/Tkinter)
+# ScanMower (Python)
 
 ## Description
-**ScanMower** is a Windows desktop application for manual scan framing and cropping, designed for cultural heritage / book scanning workflows:
+**ScanMower** is a Windows desktop application for manual scan cropping, designed for cultural heritage / book scanning workflows:
 
 - Create and edit a **frame** (quad or rectangle/square) per scan
 - Crop the current scan using the saved frame (**Crop current scan**)
