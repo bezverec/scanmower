@@ -1,0 +1,5 @@
+numpy
+opencv-python
+tifffile==2026.1.28
+Pillow
+pylcms2
