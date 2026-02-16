@@ -1,46 +1,8 @@
 #!/usr/bin/env python3
 """
-ScanMower Python (v0.0.7)
-
-UI:
-- Left: thumbnails (lazy + cached, background-loaded)
-- Center: canvas with scrollbars, zoom with mouse wheel
-- Right: settings + actions
-
-Frame editing:
-- Frame mode: rect (default) or quad
-- Drag corners to reshape (all 4 corners work in rect/quad)
-- Drag inside frame to move whole frame
-- Rect can be "lock square"
-- Optional page splitting: per scan, maintain Left/Right page frames separately
-
-Crop:
-- "Crop current scan" crops only current file
-- "Batch crop scans" crops all scans that have a saved frame
-- No extra fill beyond crop (we do NOT expand canvas with background); we only crop/warp, then optional margins
-
-Deskew:
-- Manual deskew slider + -0.1/+0.1 buttons
-- Optional auto deskew (text angle estimate within max)
-- Live deskew preview on the canvas (image + overlays rotate)
-
-Color management:
-- Optional LittleCMS2 via pylcms2 (transform embedded source ICC -> chosen destination ICC)
-
-Notes for big sets (500–1000 TIFFs):
-- Thumbnails are loaded in background threads
-- LRU cache keeps memory bounded (auto-sized for up to ~1100 thumbs)
-- View image has a small cache for fast re-render while dragging / zooming
-- Thumbnails generated via PIL first (often faster/lower memory), fallback to tifffile
-
-Keys:
-- N/P or arrows: next/prev
-- C: copy current frame -> next scan
-- M: copy+mirror current frame -> next scan
-- S: suggest frame (from previous)
-- A: crop current
-- B: batch crop
-- Esc: quit
+ScanMower (v0.0.8)
+Author: Jan Houserek
+License: LGPLv3
 """
 
 import glob
@@ -63,7 +25,7 @@ from PIL import Image, ImageTk
 
 
 APP_NAME = "ScanMower"
-SCRIPT_VERSION = "2026-02-12-scanmower-python-v0.0.7"
+SCRIPT_VERSION = "2026-02-16-scanmower-python-v0.0.8"
 
 
 # -----------------------------
@@ -938,9 +900,56 @@ class ScanMowerApp:
         center.rowconfigure(0, weight=1)
         center.columnconfigure(0, weight=1)
 
-        # RIGHT: controls
-        right = tk.Frame(panes)
-        panes.add(right, weight=0)
+        # RIGHT: controls (scrollable)
+        right_outer = ttk.Frame(panes)
+        panes.add(right_outer, weight=0)
+
+        self.right_canvas = tk.Canvas(right_outer, highlightthickness=0)
+        self.right_scroll = ttk.Scrollbar(right_outer, orient="vertical", command=self.right_canvas.yview)
+        self.right_canvas.configure(yscrollcommand=self.right_scroll.set)
+
+        self.right_scroll.pack(side="right", fill="y")
+        self.right_canvas.pack(side="left", fill="both", expand=True)
+
+        right = tk.Frame(self.right_canvas)
+        self.right_window = self.right_canvas.create_window((0, 0), window=right, anchor="nw")
+
+        def _right_on_configure(event):
+            try:
+                self.right_canvas.configure(scrollregion=self.right_canvas.bbox("all"))
+            except Exception:
+                pass
+
+        right.bind("<Configure>", _right_on_configure)
+
+        def _right_on_canvas_configure(event):
+            # Keep the inner frame width in sync with the canvas width
+            try:
+                self.right_canvas.itemconfigure(self.right_window, width=event.width)
+            except Exception:
+                pass
+
+        self.right_canvas.bind("<Configure>", _right_on_canvas_configure)
+
+        def _right_wheel(event):
+            delta = getattr(event, "delta", 0)
+            if delta == 0:
+                return
+            self.right_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+            return "break"
+
+        self.right_canvas.bind("<Enter>", lambda e: self.right_canvas.focus_set())
+        self.right_canvas.bind("<MouseWheel>", _right_wheel)
+        def _right_button4(event):
+            self.right_canvas.yview_scroll(-3, "units")
+            return "break"
+
+        def _right_button5(event):
+            self.right_canvas.yview_scroll(+3, "units")
+            return "break"
+
+        self.right_canvas.bind("<Button-4>", _right_button4)
+        self.right_canvas.bind("<Button-5>", _right_button5)
 
         # --- Project ---
         top = tk.LabelFrame(right, text="Project")
@@ -994,6 +1003,11 @@ class ScanMowerApp:
         ttk.Button(split_actions, text="Copy → next (Ctrl+C)", command=self.copy_split_to_next).pack(side="left", expand=True, fill="x", padx=2)
         ttk.Button(split_actions, text="Copy+Mirror → next (Ctrl+M)", command=self.copy_split_mirror_to_next).pack(side="left", expand=True, fill="x", padx=2)
 
+        split_actions2 = tk.Frame(split)
+        split_actions2.grid(row=5, column=0, columnspan=2, sticky="ew", padx=4, pady=2)
+        ttk.Button(split_actions2, text="Copy → end", command=self.copy_split_to_end).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(split_actions2, text="Copy → every 2nd → end", command=self.copy_split_every2_to_end).pack(side="left", expand=True, fill="x", padx=2)
+
 
         # --- Deskew ---
         desk = tk.LabelFrame(right, text="Deskew")
@@ -1034,6 +1048,11 @@ class ScanMowerApp:
         ttk.Button(desk_actions, text="Copy → next (Shift+C)", command=self.copy_deskew_to_next).pack(side="left", expand=True, fill="x", padx=2)
         ttk.Button(desk_actions, text="Copy+Mirror → next (Shift+M)", command=self.copy_deskew_mirror_to_next).pack(side="left", expand=True, fill="x", padx=2)
 
+        desk_actions2 = tk.Frame(desk)
+        desk_actions2.grid(row=5, column=0, columnspan=2, sticky="ew", padx=4, pady=2)
+        ttk.Button(desk_actions2, text="Copy → end", command=self.copy_deskew_to_end).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(desk_actions2, text="Copy → every 2nd → end", command=self.copy_deskew_every2_to_end).pack(side="left", expand=True, fill="x", padx=2)
+
 
         # --- Frames ---
         frm = tk.LabelFrame(right, text="Frames")
@@ -1070,6 +1089,12 @@ class ScanMowerApp:
         ttk.Button(frm_actions, text="Copy → next (C)", command=self.copy_to_next).pack(side="left", expand=True, fill="x", padx=2)
         ttk.Button(frm_actions, text="Copy+Mirror → next (M)", command=self.copy_mirror_to_next).pack(side="left", expand=True, fill="x", padx=2)
 
+
+        frm_actions_end = tk.Frame(frm)
+        frm_actions_end.grid(row=9, column=0, columnspan=2, sticky="ew", padx=4, pady=2)
+        ttk.Button(frm_actions_end, text="Copy → end", command=self.copy_frames_to_end).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(frm_actions_end, text="Copy → every 2nd → end", command=self.copy_frames_every2_to_end).pack(side="left", expand=True, fill="x", padx=2)
+
         frm_actions2 = tk.Frame(frm)
         frm_actions2.grid(row=8, column=0, columnspan=2, sticky="ew", padx=4, pady=2)
         ttk.Button(frm_actions2, text="Suggest frame (S)", command=self.suggest_frame_now).pack(side="left", expand=True, fill="x", padx=2)
@@ -1092,6 +1117,12 @@ class ScanMowerApp:
         marg_actions.grid(row=3, column=0, columnspan=2, sticky="ew", padx=4, pady=2)
         ttk.Button(marg_actions, text="Copy → next (Alt+C)", command=self.copy_margins_to_next).pack(side="left", expand=True, fill="x", padx=2)
         ttk.Button(marg_actions, text="Copy+Mirror → next (Alt+M)", command=self.copy_margins_mirror_to_next).pack(side="left", expand=True, fill="x", padx=2)
+
+
+        marg_actions2 = tk.Frame(margins)
+        marg_actions2.grid(row=4, column=0, columnspan=2, sticky="ew", padx=4, pady=2)
+        ttk.Button(marg_actions2, text="Copy → end", command=self.copy_margins_to_end).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(marg_actions2, text="Copy → every 2nd → end", command=self.copy_margins_every2_to_end).pack(side="left", expand=True, fill="x", padx=2)
 
 
         # --- Color management ---
@@ -1295,6 +1326,39 @@ class ScanMowerApp:
             else:
                 row.configure(bg="#1f1f1f", highlightbackground="#1f1f1f")
                 lbl.configure(bg="#1f1f1f", fg="#dddddd")
+        self._scroll_thumb_to_current()
+
+    def _scroll_thumb_to_current(self):
+        """Ensure the current thumbnail row is visible in the left panel."""
+        if not self.files:
+            return
+        cur = self._current_path()
+        row = self.thumb_rows.get(cur)
+        if row is None:
+            return
+
+        def _do():
+            try:
+                self.thumb_canvas.update_idletasks()
+                total_h = max(1, int(self.thumb_inner.winfo_height()))
+                canvas_h = max(1, int(self.thumb_canvas.winfo_height()))
+
+                y0 = int(row.winfo_y())
+                y1 = y0 + int(row.winfo_height())
+
+                f0, _ = self.thumb_canvas.yview()
+                vy0 = int(f0 * total_h)
+                vy1 = vy0 + canvas_h
+
+                if y0 < vy0:
+                    self.thumb_canvas.yview_moveto(y0 / total_h)
+                elif y1 > vy1:
+                    self.thumb_canvas.yview_moveto(max(0.0, (y1 - canvas_h) / total_h))
+            except Exception:
+                pass
+
+        self.root.after(0, _do)
+
 
     # ---------- toggling ----------
     def _toggle_side_if_enabled(self):
@@ -1903,6 +1967,110 @@ class ScanMowerApp:
 
     def copy_margins_mirror_to_next(self):
         self._copy_to_next(scope="margins", mirror=True)
+
+    # ---------- batch copy (to end) ----------
+    def _copy_scope_to_end(self, scope: str, step: int = 1):
+        """Copy selected scope from current scan to scans until the end.
+
+        step=1 -> every scan from next to end
+        step=2 -> every second scan (same parity as current) from current+2 to end
+        """
+        if not self.files:
+            return
+        step = 1 if int(step) != 2 else 2
+
+        # Ensure current is saved first
+        if self.split_enabled_var.get():
+            self._push_vars_to_active_page()
+        self.save_frame(silent=True)
+
+        # Source snapshot (current scan)
+        src = self._current_frame_data(include_image=False)
+
+        start = self.idx + step
+        if start >= len(self.files):
+            return
+
+        applied = 0
+        failed = 0
+        for j in range(start, len(self.files), step):
+            img_path = self.files[j]
+            fpath = self._frame_path(img_path)
+
+            try:
+                if fpath.exists():
+                    dst = json.loads(fpath.read_text(encoding="utf-8"))
+                else:
+                    dst = {
+                        "app": APP_NAME,
+                        "script_version": SCRIPT_VERSION,
+                        "image": str(img_path),
+                    }
+
+                if scope == "frame":
+                    dst["frame_mode"] = src.get("frame_mode", dst.get("frame_mode", "rect"))
+                    dst["lock_square"] = bool(src.get("lock_square", dst.get("lock_square", False)))
+
+                    if bool(src.get("split_enabled", False)):
+                        dst["split_enabled"] = True
+                        dst["split_mode"] = src.get("split_mode", dst.get("split_mode", "manual"))
+                        dst["split_active_page"] = src.get("split_active_page", dst.get("split_active_page", "L"))
+                        dst["pages"] = src.get("pages", {})
+                        dst.pop("quad_xy", None)
+                    else:
+                        dst["split_enabled"] = False
+                        dst.pop("pages", None)
+                        dst["quad_xy"] = src.get("quad_xy", dst.get("quad_xy", []))
+
+                elif scope == "split":
+                    dst["split_enabled"] = bool(src.get("split_enabled", dst.get("split_enabled", False)))
+                    dst["split_mode"] = src.get("split_mode", dst.get("split_mode", "manual"))
+                    dst["split_active_page"] = src.get("split_active_page", dst.get("split_active_page", "L"))
+
+                elif scope == "deskew":
+                    dst["manual_deskew_deg"] = float(src.get("manual_deskew_deg", dst.get("manual_deskew_deg", 0.0)))
+                    dst["auto_deskew"] = bool(src.get("auto_deskew", dst.get("auto_deskew", False)))
+                    dst["auto_deskew_max_deg"] = float(src.get("auto_deskew_max_deg", dst.get("auto_deskew_max_deg", 3.0)))
+
+                elif scope == "margins":
+                    dst["margin_nonspine"] = int(src.get("margin_nonspine", dst.get("margin_nonspine", 0)))
+                    dst["margin_spine"] = int(src.get("margin_spine", dst.get("margin_spine", 0)))
+
+                else:
+                    continue
+
+                fpath.write_text(json.dumps(dst, ensure_ascii=False, indent=2), encoding="utf-8")
+                applied += 1
+            except Exception as e:
+                print(f"[WARN] Copy-to-end failed for {img_path}: {e}")
+                failed += 1
+
+        msg = f"Scope: {scope}\nStep: {step}\nApplied: {applied}\nFailed: {failed}"
+        messagebox.showinfo("Copy to end", msg)
+
+    def copy_frames_to_end(self):
+        self._copy_scope_to_end(scope="frame", step=1)
+
+    def copy_frames_every2_to_end(self):
+        self._copy_scope_to_end(scope="frame", step=2)
+
+    def copy_split_to_end(self):
+        self._copy_scope_to_end(scope="split", step=1)
+
+    def copy_split_every2_to_end(self):
+        self._copy_scope_to_end(scope="split", step=2)
+
+    def copy_deskew_to_end(self):
+        self._copy_scope_to_end(scope="deskew", step=1)
+
+    def copy_deskew_every2_to_end(self):
+        self._copy_scope_to_end(scope="deskew", step=2)
+
+    def copy_margins_to_end(self):
+        self._copy_scope_to_end(scope="margins", step=1)
+
+    def copy_margins_every2_to_end(self):
+        self._copy_scope_to_end(scope="margins", step=2)
 
 
     def suggest_frame_now(self):
