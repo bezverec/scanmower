@@ -95,3 +95,8 @@ Because the executable is not code-signed, Windows may show SmartScreen warnings
 ### How to run anyway
 1) Click **More info**
 2) Click **Run anyway**
+
+## Screenshot
+<img width="2560" height="1392" alt="scanmower_0 0 8" src="https://github.com/user-attachments/assets/c16a10fe-6083-4ef8-be0f-215ed8582a03" />
+
+
