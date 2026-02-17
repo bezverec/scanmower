@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-ScanMower (v0.0.8)
+ScanMower (v0.0.8.1)
 Author: Jan Houserek
-License: LGPLv3
+License: GPLv3
 """
 
 import glob
@@ -25,7 +25,7 @@ from PIL import Image, ImageTk
 
 
 APP_NAME = "ScanMower"
-SCRIPT_VERSION = "2026-02-16-scanmower-python-v0.0.8"
+SCRIPT_VERSION = "2026-02-16-scanmower-python-v0.0.8.1"
 
 
 # -----------------------------
@@ -1668,7 +1668,7 @@ class ScanMowerApp:
         msg = (
             f"Script: {SCRIPT_VERSION}\n"
             "Author: Jan Houserek\n"
-            "License: LGPLv3\n"
+            "License: GPLv3\n"
             "\n"
             "Mouse / editing\n"
             "  • Mouse wheel: zoom (over image)\n"
